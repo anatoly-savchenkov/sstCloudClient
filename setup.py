@@ -16,5 +16,5 @@ setup(
 	],
 	keywords = ['sst-cloud','sstcloud'],
 	packages = ['sstCloud'],
-	install_requires = ['requests']
+	install_requires = ['requests','deepdiff']
 )

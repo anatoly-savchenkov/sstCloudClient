@@ -4,18 +4,16 @@ import json
 import time
 import codecs
 import sys
-import datetime
+from datetime import datetime
+from deepdiff import DeepDiff
 
 name = "sstCloudClient"
+DEBUG = True;
 
-# stole this from requests libary. To determine whether we are dealing
-# with Python 2 or 3
-_ver = sys.version_info
-
-#: Python 2.x?
-is_py2=(_ver[0]==2)
-#: Python 3.x?
-is_py3=(_ver[0]==3)
+# Hierarchy of entities:
+# User can have multiple houses
+#    Each house can have multiple devices
+#       Each device can have sensors and counters
 
 class SstCloudClient:
     def __init__(self, username, password):
@@ -24,99 +22,249 @@ class SstCloudClient:
         self.password = password
         self.user_data = None
         self.full_data = None 
-        self.homes_data = None 
-        self.reader = codecs.getdecoder("utf-8")
-        self.lastRefresh = datetime.datetime.now() 
-    
-    def _convert(self, object):
-        return json.loads(self.reader(object)[0])
+        self.houses_data = None 
+        self.lastRefresh = datetime.now() 
+        self.dataChanged = False
+        self.session = None
+        self.headers = {'content-type':'application/json', 'Accept': 'application/json'}
+
+    def release_session(self):
+        if self.session:
+            self.session.close()
+            self.session = None
+
+    def _do_get_request(self, url):
+        if self.session is None:
+            self.session = requests.Session()
+
+        response = self.session.get(url, headers=self.headers, cookies=self.user_data, stream=False)
+        if DEBUG is True:
+           print(response.request.url)
+           print(response.request.body)
+           print(response.request.headers)
+           print(response.url)
+           print(response.text)
+           print(response.headers)
+
+        if response.status_code != requests.codes.ok:
+            response.raise_for_status()
+
+        return response.json()
+
+    def _do_post_request(self, url, data):
+        if self.session is None:
+            self.session = requests.Session()
+
+        response = self.session.post(url, json=data, headers=self.headers, cookies=self.user_data, stream=False)
+        if DEBUG is True:
+           print(response.request.url)
+           print(response.request.body)
+           print(response.request.headers)
+           print(response.url)
+           print(response.text)
+           print(response.headers)
+
+        if response.status_code != requests.codes.ok:
+            response.raise_for_status()
+
+        return response
 
     def _populate_full_data(self, force_refresh=False):
         if self.full_data is None or force_refresh:
-            self._populate_user_info()
-            self._populate_homes_info()
+            try:
+                self._login()
+                self._populate_houses_info(force_refresh)
+                self.dataChanged = False
 
-            for house in self.homes_data:
-                full_data = dict()
-                full_data[house['id']] = dict() 
-                full_data[house['id']]['House'] = house
-                full_data[house['id']]['wired_sensor'] = list()
-                full_data[house['id']]['water_counter'] = list()
-                url = 'https://api.sst-cloud.com/houses/%s/devices/' % (house['id'])
-                response = requests.get(url, headers=self.headers, cookies=self.user_data)
-                full_data[house['id']]['Devices'] = list()
-                if response.status_code != 200:
-                    return False
-                json_response = response.json()
-                for device in response.json():
-                    device['parsed_configuration'] = json.loads(device['parsed_configuration'])
-                    full_data[house['id']]['Devices'].append(device)
-                    _device = device['parsed_configuration']['settings']['lines_in']
-                    for sensor, sensorType in _device.items():
-                        if sensorType == "wired_sensor":
-                            _sensor = {
-                                    'name': sensor,
-                                    'deviceid': device['id'],
-                                    'homeid' : house['id'],
-                                    'value' : device['parsed_configuration']['lines_status'][sensor]
-                                    }
-                            full_data[house['id']]['wired_sensor'].append(_sensor)
-                    full_data[house['id']]['water_counter'] = self._get_home_dev_counters(house['id'],device['id'])
-            self.full_data = full_data
-            self.lastRefresh = datetime.datetime.now()
+                for house in self.houses_data:
+                    full_data = dict()
+                    full_data[house['id']] = dict() 
+                    full_data[house['id']]['House'] = house
+                    full_data[house['id']]['wired_sensor'] = list()
+                    full_data[house['id']]['wireless_sensor'] = list()
+                    full_data[house['id']]['water_counter'] = list()
+                    full_data[house['id']]['Devices'] = list()
 
-    def _get_home_dev_counters(self, homeid, deviceid):
-        url = "https://api.sst-cloud.com/houses/%s/devices/%s/counters" % (homeid,deviceid)
-        response = requests.get(url, headers=self.headers, cookies=self.user_data)
-        return response.json()
+                    url = 'https://api.sst-cloud.com/houses/%s/devices/' % (house['id'])
+                    response = self._do_get_request(url)
 
-    def _populate_homes_info(self):
-        if self.homes_data is None:
+                    for device in response:
+                        # Process Neptun devices only.
+                        # type: 0 - mc300, 1 - mc350, 2 - Neptun
+                        if device['type'] != 2: continue
+
+                        device['parsed_configuration'] = json.loads(device['parsed_configuration'])
+                        full_data[house['id']]['Devices'].append(device)
+                        _device_line = device['parsed_configuration']['settings']['lines_in']
+                        index = 0;
+                        for sensor, sensorType in _device_line.items():
+                            if sensorType == "wired_sensor" and device['lines_enabled'][index] == True:
+                                # device['parsed_configuration']['lines_status'][sensor] can be:
+                                #  'off' - which means no alarm
+                                #  'on'  - meaning wired sensor alarm
+                                #  'blinking' - meaning alarm of a wireless sensor attached to the respecitve channel
+                                # Here we ignore 'blinking' state and handle errors coming from wireless sensors inside 
+                                # the special routine
+                                _sensor = {
+                                        'name': device['line_names'][index],
+                                        'id' : index + 1,
+                                        'deviceid': device['id'],
+                                        'houseid' : house['id'],
+                                        'value' : 'on' if device['parsed_configuration']['lines_status'][sensor] == 'on' else 'off',
+                                        }
+                                full_data[house['id']]['wired_sensor'].append(_sensor)
+                            index += 1
+
+                        for counter in self._get_house_dev_counters(house['id'],device['id']):
+                           full_data[house['id']]['water_counter'].append(counter)
+
+                        if device['parsed_configuration']['settings']['sensors_count'] > 0:
+                           for sensor in self._get_house_dev_wireless_sensors(house['id'],device['id']):
+                              full_data[house['id']]['wireless_sensor'].append(sensor)
+
+                if self.full_data != full_data:
+                    ddiff = DeepDiff(self.full_data, full_data, ignore_order=True)
+                    print (ddiff)
+                    self.full_data = full_data
+                    self.dataChanged = True
+                    self.lastRefresh = datetime.now()
+
+            except Exception as e:
+                print('Unable to communicate with server: ' + str(e))
+                if self.full_data is None: raise
+                # Unable to communicate with the server
+                # Mark all devices offline in the cached state
+                _is_changed = False
+                for house in self.houseData():
+                    for device in self.deviceData(house["id"]):
+                        if device['is_connected'] == True:
+                            device['is_connected'] = False
+                            _is_changed = True
+                if _is_changed == True:
+                    self.dataChanged = True
+                    self.lastRefresh = datetime.now()
+
+
+    def _get_house_dev_counters(self, houseid, deviceid):
+        url = "https://api.sst-cloud.com/houses/%s/devices/%s/counters" % (houseid,deviceid)
+        counters = self._do_get_request(url)
+
+        for counter in counters:
+            counter['deviceid'] = counter['device']
+            del counter['device']
+            counter['houseid'] = houseid 
+
+        return counters
+
+    def _get_house_dev_wireless_sensors(self, houseid, deviceid):
+        url = "https://api.sst-cloud.com/houses/%s/devices/%s/wireless_sensors" % (houseid,deviceid)
+        sensors = self._do_get_request(url)
+        index = 0;
+        for sensor in sensors:
+            sensor['id'] = index + 1
+            index += 1
+            sensor['deviceid'] = deviceid
+            sensor['houseid'] = houseid 
+            # I saw values above 100 (e.g. 250, 254) in case of a heavily dischanged battery
+            sensor['battery_level'] = sensor['battery'] if sensor['battery'] <= 100 and sensor['battery'] >= 0 else 0
+            del sensor['battery']
+            sensor['value'] = 'off' if sensor['attention'] == False else 'on'
+            del sensor['attention']
+
+        return sensors
+
+
+    def _get_house_dev_lines(self, houseid, deviceid):
+        url = "https://api.sst-cloud.com/houses/%s/devices/%s/lines_status" % (houseid,deviceid)
+        status = self._do_get_request(url)
+
+        #TODO: Populate internal stuctures from status dictonary
+
+
+    def _populate_houses_info(self, force_refresh=False):
+        if self.houses_data is None or force_refresh:
             url = 'https://api.sst-cloud.com/houses/'
-            response = requests.get(url, headers = self.headers, cookies = self.user_data)
-            self.homes_data = response.json()
-            if len(self.homes_data) > 1:
-                raise Exception("More than one home available")
 
-    def _populate_user_info(self):
-        if self.user_data is None:
+            self.houses_data = self._do_get_request(url)
+
+            if len(self.houses_data) > 1:
+                raise Exception("More than one house available")
+
+    def _login(self):
+        expires = None
+        if self.user_data:
+            for cookie in self.user_data:
+               if cookie.name == 'sessionid':
+                  expires = cookie.expires
+
+        if self.user_data is None or expires < (time.time() + 10):
             url = 'https://api.sst-cloud.com/auth/login/'
-            self.postdata = {'username':self.username,'password':self.password,'email':self.email,'language':'ru'}
-            self.headers = {'content-type':'application/json', 'Accept': 'application/json'}
+            data = {'username':self.username,'password':self.password,'email':self.email,'language':'ru'}
+            response = self._do_post_request(url, data)
 
-            response = requests.post(url, json=self.postdata, headers=self.headers)
+#            print(response.json()['detail']) # TODO: Improve bad login handling
+
+            # Cache session authentication data
             self.user_data = response.cookies
-            self.headers['X-CSRFToken'] = response.cookies['csrftoken']
+            self.headers['X-CSRFToken'] = self.user_data['csrftoken']
         return self.user_data
+
+# TODO: Incomplete routine
+    def _get_house_statistics(self, houseid):
+        date_from = "2021-01-01"
+        date_to   = "2021-02-19"
+        interval = "day" #hour, day or month
+        url = "https://api.sst-cloud.com/statistic/houses/%s/?date_from=%s&date_to=%s&interval=%s" % (houseid, date_from, date_to, interval)
+        return self._do_get_request(url)
 
     def test(self):
         self._populate_full_data()
-        print(json.dumps(self.homes_data,sort_keys=True,indent=4))
-        print(json.dumps(self.full_data,sort_keys=True,indent=4))
+        print(json.dumps(self.houses_data,sort_keys=True,indent=2,ensure_ascii=False))
+        print(json.dumps(self.full_data,sort_keys=True,indent=2,ensure_ascii=False))
+
+    def houseData(self, force_refresh=False):
+        if self.houses_data is None or force_refresh:
+            self._login()
+            self._populate_houses_info(force_refresh)
+
+        for house in self.houses_data:
+            yield house
+
+    def deviceData(self, houseid, force_refresh=False):
+        self._populate_full_data(force_refresh)
+        house = self.full_data[houseid]
+
+        for device in house['Devices']:
+            yield device
+
+    def deviceById(self, houseid, deviceid):
+        house = self.full_data[houseid]
+
+        for device in house['Devices']:
+            if device['id'] == deviceid: return device
+
+        return None
 
     def waterCounters(self, houseid, force_refresh=False):
         self._populate_full_data(force_refresh)
         house = self.full_data[houseid]
-        for sensor in house['water_counter']:
-            sensor['deviceid'] = sensor['device']
-            del sensor['device']
-            sensor['homeid'] = houseid 
-            yield sensor 
+        for counter in house['water_counter']:
+            yield counter
 
-    def wiredSensors(self, homeid, force_refresh=False):
+    def wiredSensors(self, houseid, force_refresh=False):
         self._populate_full_data(force_refresh)
-        house = self.full_data[homeid]
+        house = self.full_data[houseid]
         for sensor in house['wired_sensor']:
             yield sensor 
 
-    def status(self, homeid, force_refresh=False):
+    def status(self, houseid, force_refresh=False):
         self._populate_full_data(force_refresh)
-        house = self.full_data[homeid]
+        house = self.full_data[houseid]
         status = list()
         for device in house['Devices']:
             status.append({
                 'name':device['name'],
-                'homeid':device['house'],
+                'houseid':device['house'],
                 'deviceid':device['id'],
                 'close_valve_flag':device['parsed_configuration']['settings']['close_valve_flag'],
                 'dry_flag':device['parsed_configuration']['settings']['dry_flag'],
@@ -128,38 +276,38 @@ class SstCloudClient:
                 })
         return status
 
-    def setValve(self, homeid, deviceid, value=False):
-        url = 'https://api.sst-cloud.com/houses/%s/devices/%s/valve_settings/' % (homeid, deviceid)
+    def setValve(self, houseid, deviceid, value=False):
+        url = 'https://api.sst-cloud.com/houses/%s/devices/%s/valve_settings/' % (houseid, deviceid)
         data = {
                 'valve_settings':'opened' if value else 'closed'
                 }
-        response = requests.post(url, json=data, headers = self.headers, cookies = self.user_data)
+        self._do_post_request(url, data)
         self._populate_full_data(True)
 
-    def setValveOpen(self, homeid, deviceid):
-        self.setValve(homeid,deviceid,True)
+    def setValveOpen(self, houseid, deviceid):
+        self.setValve(houseid,deviceid,True)
 
-    def setValveClosed(self, homeid, deviceid):
-        self.setValve(homeid,deviceid,False)
+    def setValveClosed(self, houseid, deviceid):
+        self.setValve(houseid,deviceid,False)
 
-    def getValve(self, homeid, deviceid):
+    def getValve(self, houseid, deviceid):
         self._populate_full_data()
-        house = self.full_data[homeid]
+        house = self.full_data[houseid]
         for device in house['Devices']:
             if device['id'] == deviceid:
                 return device['parsed_configuration']['settings']['valve_settings']
         return None
 
-    def setDryFlag(self, homeid, deviceid, value=False):
-        url = 'https://api.sst-cloud.com/houses/%s/devices/%s/dry_flag/' % (homeid, deviceid)
+    def setDryFlag(self, houseid, deviceid, value=False):
+        url = 'https://api.sst-cloud.com/houses/%s/devices/%s/dry_flag/' % (houseid, deviceid)
         data = {
                 'dry_flag' : 'on' if value else 'off'
                 }
-        response = requests.post(url, json=data, headers = self.headers, cookies = self.user_data)
+        self._do_post_request(url, data)
         self._populate_full_data(True)
 
-    def setDryOn(self, homeid, deviceid):
-        self.setDryFlag(homeid, deviceid, True)
+    def setDryOn(self, houseid, deviceid):
+        self.setDryFlag(houseid, deviceid, True)
 
-    def setDryOff(self, homeid, deviceid):
-        self.setDryFlag(homeid, deviceid, False)
+    def setDryOff(self, houseid, deviceid):
+        self.setDryFlag(houseid, deviceid, False)
